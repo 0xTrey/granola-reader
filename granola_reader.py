@@ -22,6 +22,8 @@ import argparse
 import json
 import re
 import sys
+import time
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
@@ -29,6 +31,14 @@ from typing import Optional
 
 
 CACHE_PATH = Path.home() / "Library" / "Application Support" / "Granola" / "cache-v3.json"
+
+# Domains to exclude from company extraction (personal email providers)
+_PERSONAL_DOMAINS = frozenset({
+    "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "icloud.com",
+    "me.com", "aol.com", "protonmail.com", "live.com", "msn.com",
+    "googlemail.com", "ymail.com",
+    "resource.calendar.google.com",
+})
 
 
 class _HTMLToMarkdown(HTMLParser):
@@ -126,6 +136,21 @@ class GranolaReader:
         """Force reload from disk (useful if Granola updated the cache)."""
         self._state = None
         self._load()
+
+    def cache_age_seconds(self) -> float:
+        """Return age of the cache file in seconds based on file mtime."""
+        if not self._cache_path.exists():
+            raise FileNotFoundError(
+                f"Granola cache not found at {self._cache_path}."
+            )
+        return time.time() - self._cache_path.stat().st_mtime
+
+    def is_stale(self, max_age: int = 3600) -> bool:
+        """Check if cache file is older than max_age seconds (default: 1 hour)."""
+        try:
+            return self.cache_age_seconds() > max_age
+        except FileNotFoundError:
+            return True
 
     def get_meetings(
         self,
@@ -441,6 +466,157 @@ class GranolaReader:
             "transcript": transcript["entries"],
         }
 
+    def get_daily_digest(self, date: Optional[str] = None) -> dict:
+        """
+        Get a structured digest of all meetings for a single day.
+
+        Combines meeting metadata, AI-generated summaries, attendee info,
+        and company domains into a single dict ready for pipeline consumption.
+
+        Args:
+            date: Date string (YYYY-MM-DD). Defaults to today.
+
+        Returns dict with keys:
+            date, cache_age_seconds, is_stale, meeting_count,
+            meetings (list of enriched dicts with summary text),
+            companies_engaged (dict of domain -> interaction count)
+        """
+        if date is None:
+            date = datetime.now().strftime("%Y-%m-%d")
+
+        meetings = self.get_meetings(since=date, until=date)
+
+        enriched = []
+        companies: dict[str, int] = defaultdict(int)
+
+        for m in meetings:
+            notes = self.get_notes(m["id"])
+
+            summary_parts = [p["content"] for p in notes["panels"] if p["content"]]
+            summary = "\n\n".join(summary_parts)
+
+            meeting_companies = self._extract_companies(m["attendees"])
+            for domain in meeting_companies:
+                companies[domain] += 1
+
+            enriched.append({
+                "id": m["id"],
+                "title": m["title"],
+                "date": m["date"],
+                "start_time": m["start_time"],
+                "attendees": m["attendees"],
+                "companies": meeting_companies,
+                "summary": summary,
+                "user_notes": notes["user_notes"],
+                "has_transcript": m["has_transcript"],
+            })
+
+        age = 0.0
+        stale = True
+        try:
+            age = self.cache_age_seconds()
+            stale = self.is_stale()
+        except FileNotFoundError:
+            pass
+
+        return {
+            "date": date,
+            "cache_age_seconds": round(age, 1),
+            "is_stale": stale,
+            "meeting_count": len(enriched),
+            "meetings": enriched,
+            "companies_engaged": dict(
+                sorted(companies.items(), key=lambda x: x[1], reverse=True)
+            ),
+        }
+
+    def get_weekly_digest(self, week_of: Optional[str] = None) -> dict:
+        """
+        Get a structured digest of all meetings for a Monday-Sunday week.
+
+        Args:
+            week_of: Any date in the target week (YYYY-MM-DD).
+                     Defaults to the current week.
+
+        Returns dict with keys:
+            start_date, end_date, cache_age_seconds, is_stale,
+            meeting_count, meetings (flat list), daily (dict of date -> list),
+            companies_engaged (dict of domain -> count)
+        """
+        if week_of:
+            ref = datetime.strptime(week_of, "%Y-%m-%d")
+        else:
+            ref = datetime.now()
+
+        monday = ref - timedelta(days=ref.weekday())
+        sunday = monday + timedelta(days=6)
+        start_date = monday.strftime("%Y-%m-%d")
+        end_date = sunday.strftime("%Y-%m-%d")
+
+        meetings = self.get_meetings(since=start_date, until=end_date)
+
+        enriched = []
+        daily: dict[str, list] = defaultdict(list)
+        companies: dict[str, int] = defaultdict(int)
+
+        for m in meetings:
+            notes = self.get_notes(m["id"])
+
+            summary_parts = [p["content"] for p in notes["panels"] if p["content"]]
+            summary = "\n\n".join(summary_parts)
+
+            meeting_companies = self._extract_companies(m["attendees"])
+            for domain in meeting_companies:
+                companies[domain] += 1
+
+            entry = {
+                "id": m["id"],
+                "title": m["title"],
+                "date": m["date"],
+                "start_time": m["start_time"],
+                "attendees": m["attendees"],
+                "companies": meeting_companies,
+                "summary": summary,
+                "user_notes": notes["user_notes"],
+                "has_transcript": m["has_transcript"],
+            }
+
+            enriched.append(entry)
+            daily[m["date"]].append(entry)
+
+        age = 0.0
+        stale = True
+        try:
+            age = self.cache_age_seconds()
+            stale = self.is_stale()
+        except FileNotFoundError:
+            pass
+
+        return {
+            "start_date": start_date,
+            "end_date": end_date,
+            "cache_age_seconds": round(age, 1),
+            "is_stale": stale,
+            "meeting_count": len(enriched),
+            "meetings": enriched,
+            "daily": dict(sorted(daily.items())),
+            "companies_engaged": dict(
+                sorted(companies.items(), key=lambda x: x[1], reverse=True)
+            ),
+        }
+
+    def _extract_companies(self, attendees: list[dict]) -> list[str]:
+        """Extract unique company domains from attendee emails, excluding personal providers."""
+        domains = set()
+        for a in attendees:
+            email = a.get("email", "")
+            if "@" not in email:
+                continue
+            domain = email.split("@")[1].lower()
+            if domain not in _PERSONAL_DOMAINS:
+                domains.add(domain)
+        return sorted(domains)
+
     def _extract_attendees(self, doc: dict, state: dict) -> list[dict]:
         """Extract attendee info from calendar event or meetings metadata."""
         attendees = []
@@ -587,6 +763,80 @@ def _format_transcript(transcript: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_digest(digest: dict) -> str:
+    """Format a daily or weekly digest as readable output."""
+    lines = []
+
+    # Header
+    if "start_date" in digest:
+        lines.append(f"Week: {digest['start_date']} to {digest['end_date']}")
+    else:
+        lines.append(f"Date: {digest['date']}")
+
+    age = digest["cache_age_seconds"]
+    if age < 60:
+        age_str = f"{age:.0f}s"
+    elif age < 3600:
+        age_str = f"{age / 60:.0f}m"
+    else:
+        age_str = f"{age / 3600:.1f}h"
+    stale_warn = " (STALE)" if digest["is_stale"] else ""
+    lines.append(f"Cache age: {age_str}{stale_warn}")
+    lines.append(f"Meetings: {digest['meeting_count']}")
+    lines.append("")
+
+    # Meetings grouped by day for weekly, flat for daily
+    if "daily" in digest:
+        for day, day_meetings in digest["daily"].items():
+            lines.append(f"--- {day} ({len(day_meetings)} meetings) ---")
+            lines.append("")
+            for m in day_meetings:
+                lines.extend(_format_digest_meeting(m))
+    else:
+        for m in digest["meetings"]:
+            lines.extend(_format_digest_meeting(m))
+
+    # Companies
+    if digest["companies_engaged"]:
+        lines.append("--- Companies engaged ---")
+        for domain, count in digest["companies_engaged"].items():
+            lines.append(f"  {domain} ({count})")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _format_digest_meeting(m: dict) -> list[str]:
+    """Format a single meeting entry within a digest."""
+    lines = []
+    time_str = ""
+    if m["start_time"]:
+        try:
+            dt = datetime.fromisoformat(m["start_time"])
+            time_str = f" at {dt.strftime('%H:%M')}"
+        except ValueError:
+            pass
+
+    lines.append(f"  {m['id'][:8]}  {m['title']}{time_str}")
+
+    attendee_names = [a["name"] or a["email"] for a in m["attendees"]]
+    if attendee_names:
+        lines.append(f"           Attendees: {', '.join(attendee_names[:5])}")
+
+    if m["companies"]:
+        lines.append(f"           Companies: {', '.join(m['companies'])}")
+
+    # Show first 200 chars of summary
+    if m["summary"]:
+        preview = m["summary"][:200].replace("\n", " ")
+        if len(m["summary"]) > 200:
+            preview += "..."
+        lines.append(f"           Summary: {preview}")
+
+    lines.append("")
+    return lines
+
+
 def _format_search(results: list[dict]) -> str:
     """Format search results."""
     if not results:
@@ -639,6 +889,13 @@ def main():
     p_full = sub.add_parser("full", help="Get everything for a meeting")
     p_full.add_argument("doc_id", help="Document ID (or first 8 chars)")
     p_full.add_argument("--json", action="store_true", help="Output as JSON")
+
+    # digest
+    p_digest = sub.add_parser("digest", help="Daily or weekly meeting digest")
+    p_digest.add_argument("--date", help="Date for daily digest (YYYY-MM-DD, default: today)")
+    p_digest.add_argument("--weekly", action="store_true", help="Generate weekly digest")
+    p_digest.add_argument("--week-of", help="Any date in target week (YYYY-MM-DD, default: this week)")
+    p_digest.add_argument("--json", action="store_true", help="Output as JSON")
 
     args = parser.parse_args()
     gr = GranolaReader()
@@ -727,6 +984,16 @@ def main():
                     ts = entry["timestamp"][:19].replace("T", " ") if entry["timestamp"] else ""
                     source = entry.get("speaker") or entry["source"]
                     print(f"  {ts}  [{source}] {entry['text']}")
+
+    elif args.command == "digest":
+        if args.weekly or args.week_of:
+            digest = gr.get_weekly_digest(week_of=args.week_of)
+        else:
+            digest = gr.get_daily_digest(date=args.date)
+        if args.json:
+            print(json.dumps(digest, indent=2))
+        else:
+            print(_format_digest(digest))
 
 
 if __name__ == "__main__":
