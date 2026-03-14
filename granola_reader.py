@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Optional
 
 
-CACHE_PATH = Path.home() / "Library" / "Application Support" / "Granola" / "cache-v3.json"
+CACHE_PATH = Path.home() / "Library" / "Application Support" / "Granola" / "cache-v6.json"
 
 # Domains to exclude from company extraction (personal email providers)
 _PERSONAL_DOMAINS = frozenset({
@@ -129,7 +129,7 @@ class GranolaReader:
             )
 
         raw = json.loads(self._cache_path.read_text())
-        self._state = json.loads(raw["cache"])["state"]
+        self._state = raw["cache"]["state"]
         return self._state
 
     def reload(self):
