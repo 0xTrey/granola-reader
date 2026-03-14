@@ -8,5 +8,8 @@ version = "0.1.0"
 description = "Read Granola meeting notes from local cache"
 requires-python = ">=3.10"
 
+[tool.setuptools]
+py-modules = ["granola_reader"]
+
 [project.scripts]
 granola = "granola_reader:main"
