@@ -32,6 +32,32 @@ from typing import Optional
 
 CACHE_PATH = Path.home() / "Library" / "Application Support" / "Granola" / "cache-v6.json"
 
+# Granola v6 moved AI-generated panels out of documentPanels (now always empty).
+# Fall back to the Granola API (/v1/get-document-panels) when panels are missing.
+# Auth comes from ~/Library/Application Support/Granola/supabase.json (WorkOS token).
+# Lazily initialized on first use to avoid circular imports (granola_api imports
+# html_to_markdown from this module, which isn't defined yet at module load time).
+_API_CLIENT = None
+_API_CLIENT_INITIALIZED = False
+_GRANOLA_SYNC_PATH = str(Path.home() / "Projects" / "granola-sync")
+
+
+def _get_api_client():
+    """Return a GranolaAPIClient, initializing once on first call."""
+    global _API_CLIENT, _API_CLIENT_INITIALIZED
+    if _API_CLIENT_INITIALIZED:
+        return _API_CLIENT
+    _API_CLIENT_INITIALIZED = True
+    try:
+        import sys as _sys
+        if _GRANOLA_SYNC_PATH not in _sys.path:
+            _sys.path.insert(0, _GRANOLA_SYNC_PATH)
+        from granola_api import GranolaAPIClient as _GranolaAPIClient
+        _API_CLIENT = _GranolaAPIClient()
+    except Exception:
+        _API_CLIENT = None
+    return _API_CLIENT
+
 # Domains to exclude from company extraction (personal email providers)
 _PERSONAL_DOMAINS = frozenset({
     "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "icloud.com",
@@ -216,6 +242,7 @@ class GranolaReader:
             # Determine content availability
             has_notes = bool(doc.get("notes_markdown") or doc.get("notes_plain"))
             has_panel = bool(panels.get(doc_id))
+            has_ai_summary = has_panel or bool(doc.get("summary"))
             has_transcript = bool(transcripts.get(doc_id))
 
             # Get meeting start time from calendar event
@@ -233,6 +260,7 @@ class GranolaReader:
                 "attendees": attendees,
                 "has_notes": has_notes,
                 "has_panel": has_panel,
+                "has_ai_summary": has_ai_summary,
                 "has_transcript": has_transcript,
                 "valid_meeting": doc.get("valid_meeting", False),
                 "type": doc.get("type", ""),
@@ -277,6 +305,7 @@ class GranolaReader:
             result["user_notes"] = doc["notes_plain"]
 
         # AI-generated panels (structured summaries)
+        # v3: stored in documentPanels; v6: documentPanels is empty, check doc['summary']
         panels = state.get("documentPanels", {}).get(doc_id, {})
         for panel_id, panel in panels.items():
             if not isinstance(panel, dict):
@@ -297,14 +326,12 @@ class GranolaReader:
                 if html:
                     panel_entry["content"] = html_to_markdown(html)
                 else:
-                    # Fall back to tiptap JSON content
                     panel_entry["content"] = self._tiptap_to_text(
                         panel.get("content", {})
                     )
             else:
                 html = panel.get("original_content", "")
                 if html:
-                    # Strip tags for plain text
                     panel_entry["content"] = re.sub(r"<[^>]+>", "", html)
                 else:
                     panel_entry["content"] = self._tiptap_to_text(
@@ -312,6 +339,35 @@ class GranolaReader:
                     )
 
             result["panels"].append(panel_entry)
+
+        # v6 fallback 1: doc-level summary field (may be populated in future releases)
+        if not result["panels"] and doc.get("summary"):
+            summary = doc["summary"]
+            if isinstance(summary, str):
+                result["panels"].append({
+                    "id": "summary",
+                    "title": "Summary",
+                    "template": "summary",
+                    "content": summary,
+                })
+            elif isinstance(summary, dict):
+                content = self._tiptap_to_text(summary)
+                if content:
+                    result["panels"].append({
+                        "id": "summary",
+                        "title": "Summary",
+                        "template": "summary",
+                        "content": content,
+                    })
+
+        # v6 fallback 2: fetch from Granola API (uses WorkOS token from supabase.json)
+        api_client = _get_api_client()
+        if not result["panels"] and api_client is not None:
+            try:
+                api_panels = api_client.get_document_panels(doc_id)
+                result["panels"].extend(api_panels)
+            except Exception:
+                pass  # API unavailable — caller gets empty panels
 
         return result
 
